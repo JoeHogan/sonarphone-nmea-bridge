@@ -1,57 +1,117 @@
-# SP200A Bridge — dev APK runbook
+# SP200A Bridge developer runbook
 
-Debug build, drivable entirely over ADB. Package: `ca.dynamicsolutions.sonarbridge`.
+The GitHub-flavor debug APK can be built and driven entirely over ADB. Its
+package is `ca.dynamicsolutions.sonarbridge`. Run commands from the repository
+root unless a section says otherwise.
 
-## Build (Docker, no host installs)
+## Build
+
+The long-lived `sonarbridge-builder` container is arm64-native and keeps the
+Gradle cache warm. Start it if it already exists but is stopped:
 
 ```sh
-docker run --rm -u $(id -u):$(id -g) -e GRADLE_USER_HOME=/project/.gradle \
-  -v "$PWD/android":/project -w /project \
-  alvrme/alpine-android:android-34-jdk17 ./gradlew --no-daemon assembleDebug
-# -> android/app/build/outputs/apk/debug/app-debug.apk
+docker start sonarbridge-builder
+docker exec sonarbridge-builder ./gradlew assembleGithubDebug
+stat android/app/build/outputs/apk/github/debug/app-github-debug.apk
 ```
 
-## Connect the phone (WSL2-friendly: wireless debugging)
+The Gradle command must finish successfully, and the APK modification time must
+advance. Do not rely on the last output line alone because a failed build can
+still end with a configuration-cache message.
 
-The host `~/.android` holds the adb key the Pixel 9 Pro already trusts
-(recovered from the `persistent-android-data` Docker volume), so no pairing is
-needed — just turn on Wireless debugging and rediscover the rotated port:
+If the builder does not exist, create it once:
 
 ```sh
-# discovery script from the persistent project (tiered port scan; mDNS
-# doesn't cross the WSL2 NAT). Seed it with the phone's current/last IP:
-python3 ~/development/persistent/.devcontainer/adb-discover.py 192.168.2.98
-adb devices    # e.g. 192.168.2.98:38875  device  model:Pixel_9_Pro
+docker build -t sonarbridge-build:arm64 \
+  -f android/docker/Dockerfile.arm64 android/docker
+mkdir -p android/.gradle
+printf 'android.aapt2FromMavenOverride=/opt/android-tools/aapt2\n' \
+  > android/.gradle/gradle.properties
+docker run -d --name sonarbridge-builder --restart unless-stopped \
+  -u "$(id -u):$(id -g)" \
+  -e GRADLE_USER_HOME=/project/.gradle \
+  -v "$PWD/android:/project" -w /project \
+  sonarbridge-build:arm64 sleep infinity
 ```
 
-If the IP moved too: ping-sweep the /24, then check the *Windows* ARP table
-(`/mnt/c/Windows/System32/ARP.EXE -a`) for locally-administered MACs (second
-hex digit 2/6/a/e — Android per-network MAC randomization) and scan those.
+The AAPT2 override is container-local and gitignored. Do not add it to the
+committed `android/gradle.properties`, where it would break non-arm64 builds.
+The pinned debug keystore at `android/keystore/debug.keystore` keeps
+`adb install -r` compatible across builds.
 
-## Install & drive
+## Connect the phone
+
+The Pixel 9 Pro already trusts the ADB key in the host's Android configuration.
+Wireless debugging must still be enabled for its current network.
 
 ```sh
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb devices
+python3 scripts/find-phone.py <phone-ip>
+adb devices
+```
 
-# start (defaults: pattern "SonarPhone_" prefix picker, pass 12345678)
+The script remembers successful endpoints in `~/.android/adb-endpoint` and
+rediscovers a rotated wireless-debugging port. If it has no usable saved
+endpoint, get `<phone-ip>` from **Settings > Developer options > Wireless
+debugging > IP address & Port**. Use the IP only.
+
+Do not guess the phone from randomized MAC addresses or scan the whole subnet.
+The Pixel does not reliably answer ICMP, other devices use randomized MACs,
+and ADB mDNS does not cross WSL2 NAT.
+
+## Install
+
+```sh
+adb install -r android/app/build/outputs/apk/github/debug/app-github-debug.apk
+adb shell pm grant ca.dynamicsolutions.sonarbridge android.permission.POST_NOTIFICATIONS
+adb shell dumpsys package ca.dynamicsolutions.sonarbridge | grep lastUpdateTime
+```
+
+Confirm that `lastUpdateTime` changed. A debug build and a release build use
+different signing keys, so switching between them can require one uninstall
+and will clear settings.
+
+## Drive and observe
+
+Start the service with the default `SonarPhone_` prefix and password:
+
+```sh
 adb shell am start-foreground-service \
   -n ca.dynamicsolutions.sonarbridge/.BridgeService \
-  -a ca.dynamicsolutions.sonarbridge.START \
-  -e pass "12345678"   # add -e ssid "X" for exact, -e pattern "T-BOX-" for prefix
-
-# optional extras:
-#   -e lograw true   log raw REDYFC frames (timestamped) to app files dir
-#   -e udp 2000      also emit NMEA via UDP to 127.0.0.1:2000 (Navionics fallback)
-
-# stop
-adb shell am start-foreground-service \
-  -n ca.dynamicsolutions.sonarbridge/.BridgeService -a ca.dynamicsolutions.sonarbridge.STOP
+  -a ca.dynamicsolutions.sonarbridge.START
 ```
 
-First start shows the system WiFi-connect approval dialog on the phone —
-accept once. Bridge state machine: `WIFI_WAIT → DISCOVER (FX @1 Hz) →
-RUN (FC @10 s) → DISCOVER on 15 s silence`. `NEED_MASTER` means the T-Box is
-factory-fresh (11:11… sentinel): run the official SonarPhone app once.
+Optional extras are `-e ssid X` for an exact SSID, `-e pattern PREFIX`,
+`-e pass Y`, `-e lograw true`, `-e udp 2000`, and `-e demo true`.
+
+Stop the service:
+
+```sh
+adb shell am start-foreground-service \
+  -n ca.dynamicsolutions.sonarbridge/.BridgeService \
+  -a ca.dynamicsolutions.sonarbridge.STOP
+```
+
+Observe logs and the NMEA stream:
+
+```sh
+adb logcat -s SonarBridge
+adb forward tcp:10110 tcp:10110
+nc 127.0.0.1 10110
+```
+
+Pull raw frames after starting with `-e lograw true`:
+
+```sh
+adb pull /sdcard/Android/data/ca.dynamicsolutions.sonarbridge/files/ ./frames/
+```
+
+The state machine is `WIFI_WAIT → DISCOVER (FX @1 Hz) → RUN (FC @10 s) →
+DISCOVER` after 15 seconds of silence. `NEED_MASTER` means the T-Box is
+factory-fresh; run the official SonarPhone app once. The first connection can
+show Android's Wi-Fi approval dialog, which the user must accept on the phone.
+If the T-Box is off, stop the service after testing so the dialog does not
+reappear repeatedly.
 
 ## Watch it work
 
@@ -69,34 +129,34 @@ adb pull /sdcard/Android/data/ca.dynamicsolutions.sonarbridge/files/ ./frames/
 
 Raw log record format: `u64le wall-clock ms, u16le frame length, frame bytes`.
 
-## Navionics pairing (on the phone)
+## Navionics pairing
 
 Menu → Paired devices → **+** → Host `127.0.0.1`, Port `10110`, Protocol TCP.
-If it refuses loopback TCP, restart the bridge with `-e udp 2000` and try the
-UDP option — this is the key risk to validate.
+Loopback TCP is verified with Navionics on Android. UDP on port 2000 remains a
+legacy fallback.
 
-## Validation checklist (phase 0, now on-phone)
+## Validation checklist
 
 1. `STATE DISCOVER` → `REDYFX serial=… masterMac=…` decodes sanely.
 2. `STATE RUN`, `FRAME` lines: note packet size, depth/temp vs known water.
 3. No-bottom-lock behavior: watch depth field with transducer out of water.
 4. Stream survives on 10 s FC cadence; watchdog recovers after AP power-cycle.
 5. Phone keeps internet while attached to T-Box AP (browse in another app).
-6. Navionics pairs to 127.0.0.1:10110 and shows depth — THE unverified risk.
+6. Navionics pairs to 127.0.0.1:10110 and shows depth.
 7. Screen off 10+ min: stream continues (check FRAME counter in logcat).
 8. Enable Menu > SonarChart Live in Navionics while moving: our NMEA depth +
    phone GPS should draw live personal bathymetry contours (the bridge acts
    as a free Digital Yacht Sonar Server). Raw-sonar split view is NOT
-   possible — Garmin removed third-party sonar rendering after v19.
+   possible because Garmin removed third-party sonar rendering after v19.
 
 ## Releases & updates
 
-- Cut a release: `git tag v0.2.0 && git push origin v0.2.0` — GitHub Actions
+- Cut a release: `git tag v0.2.0 && git push origin v0.2.0`. GitHub Actions
   builds a signed APK and publishes a Release with a filtered changelog.
 - The app checks the latest release on open/resume (3 h throttle) and offers
   the APK with the release notes; "Later" mutes that version.
 - Release signing: keystore lives only in GitHub secrets + gitignored
   `android/keystore/release.keystore` (creds in `release.env` beside it).
-- NOTE: release APKs are signed with the release key — a phone running a
+- NOTE: release APKs are signed with the release key. A phone running a
   debug build must uninstall once before its first release install
   (signature mismatch; settings are lost that one time).
