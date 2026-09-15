@@ -1,7 +1,9 @@
 package ca.dynamicsolutions.sonarbridge
 
+import android.Manifest
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Typeface
 import android.net.Uri
@@ -9,6 +11,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import android.text.InputType
 import android.view.Menu
 import android.view.View
@@ -61,6 +65,23 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var content: FrameLayout
     private var currentTab = -1
+
+    // NEARBY_WIFI_DEVICES runtime permission (required API 33+ for WifiNetworkSpecifier)
+    private var pendingStartIntent: Intent? = null
+    private val nearbyWifiLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            pendingStartIntent?.let { startForegroundService(it) }
+        } else {
+            Toast.makeText(
+                this,
+                "\"Nearby devices\" permission is required — the WiFi picker cannot find your sonar without it.",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+        pendingStartIntent = null
+    }
 
     // status tab
     private lateinit var statusView: View
@@ -253,7 +274,7 @@ class MainActivity : AppCompatActivity() {
                     .putExtra("demo", prefs.getBoolean("demo", false).toString())
                 if (pattern != null) intent.putExtra("pattern", pattern)
                 else intent.putExtra("ssid", prefs.getString("ssid", "SonarPhone_65C0")!!.toString())
-                startForegroundService(intent)
+                startBridgeWithPermissionCheck(intent)
             }
         }
         battery.setOnClickListener {
@@ -665,6 +686,26 @@ class MainActivity : AppCompatActivity() {
             })
             .apply()
         Units.load(prefs)
+    }
+
+    // ---------------------------------------------------------------- permissions
+
+    /**
+     * Start the bridge service, requesting NEARBY_WIFI_DEVICES first if needed.
+     * The permission is required on API 33+ for the WifiNetworkSpecifier picker
+     * to scan and list matching networks. Demo mode skips the check (no WiFi).
+     */
+    private fun startBridgeWithPermissionCheck(intent: Intent) {
+        val isDemo = intent.getStringExtra("demo") == "true"
+        if (!isDemo && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES)
+                != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingStartIntent = intent
+            nearbyWifiLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
+        } else {
+            startForegroundService(intent)
+        }
     }
 
     // ---------------------------------------------------------------- misc
